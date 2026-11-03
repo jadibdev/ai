@@ -765,6 +765,7 @@ export async function createPiSession(
           mcpRegistrationError = error;
         }
       },
+      createRestoredMcpToolsExtension(mcpServers.map(([name]) => name)),
     );
   }
   const hasExtensionFactories = extensionFactories.length > 0;
@@ -1927,6 +1928,63 @@ function createInMemoryMcpCredentialStore(): PiMcpCredentialStore {
   };
   // Pi types the option as its store class, which has private members.
   return store as PiMcpCredentialStore;
+}
+
+const RESTORED_MCP_TOOLS_TIMEOUT_MS = 10_000;
+const RESTORED_MCP_TOOLS_POLL_MS = 25;
+
+/*
+ * When a session is rebuilt from its entries, Pi restores the MCP tools of the
+ * recorded loadout as pending while the servers connect. If the first request
+ * is prepared before they register, Pi declares them removed and keeps them
+ * inactive, so a deferred tool that `tool_search` loaded in an earlier turn is
+ * gone. Before the first agent loop of each Pi runtime, wait for the MCP tools
+ * that the transcript still declares to register, and activate them again.
+ */
+function createRestoredMcpToolsExtension(
+  serverNames: ReadonlyArray<string>,
+): ExtensionFactory {
+  // Pi names MCP tools `mcp__<server>__<tool>`, with `-` replaced by `_`.
+  const prefixes = serverNames.map(name => `mcp__${name.replace(/-/g, '_')}__`);
+  return (pi: ExtensionAPI) => {
+    let checked = false;
+    pi.on('before_agent_start', async (_event, ctx) => {
+      if (checked) return;
+      checked = true;
+
+      const declared = new Set<string>();
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== 'message' || entry.message.role !== 'system') {
+          continue;
+        }
+        for (const tool of entry.message.toolsRemoved ?? []) {
+          declared.delete(tool.name);
+        }
+        for (const tool of entry.message.toolsAdded ?? []) {
+          declared.add(tool.name);
+        }
+      }
+      const active = new Set(pi.getActiveTools());
+      const restored = [...declared].filter(
+        name =>
+          !active.has(name) && prefixes.some(prefix => name.startsWith(prefix)),
+      );
+      if (restored.length === 0) return;
+
+      const isRegistered = (name: string) =>
+        pi.getAllTools().some(tool => tool.name === name);
+      const deadline = Date.now() + RESTORED_MCP_TOOLS_TIMEOUT_MS;
+      while (!restored.every(isRegistered) && Date.now() < deadline) {
+        await new Promise(resolve =>
+          setTimeout(resolve, RESTORED_MCP_TOOLS_POLL_MS),
+        );
+      }
+      const registered = restored.filter(isRegistered);
+      if (registered.length > 0) {
+        pi.setActiveTools([...pi.getActiveTools(), ...registered]);
+      }
+    });
+  };
 }
 
 function assertPiMcpSettingsSupported(

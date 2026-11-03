@@ -1,10 +1,14 @@
-import type { HarnessV1StreamPart } from '@ai-sdk/harness';
+import type {
+  HarnessV1ResumeSessionState,
+  HarnessV1StreamPart,
+} from '@ai-sdk/harness';
 import { createJustBashSandbox } from '@ai-sdk/sandbox-just-bash';
 import { readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPi } from './pi-harness';
+import type { PiSessionStorage } from './pi-session-storage';
 import {
   close,
   createFakePi,
@@ -17,6 +21,8 @@ import {
 } from './test-helpers';
 
 const MCP_TOKEN = 'mcp-test-token';
+
+type StoredEntry = Parameters<PiSessionStorage['append']>[0]['entry'];
 
 type JsonRpcRequest = {
   readonly id?: number | string;
@@ -59,6 +65,8 @@ const createMcpServer = () => {
   const requests: McpRequestRecord[] = [];
   const sessionIds = new Map<string, string>();
   const deletedSessionIds: string[] = [];
+  // Delays `tools/list`, so tests can hold a session's MCP tools back.
+  const options = { toolsListDelayMs: 0 };
 
   const respond = (
     response: ServerResponse,
@@ -116,6 +124,9 @@ const createMcpServer = () => {
       return;
     }
     if (message.method === 'tools/list') {
+      await new Promise(resolve =>
+        setTimeout(resolve, options.toolsListDelayMs),
+      );
       respond(response, sessionId, message.id, {
         tools: Object.entries(tools).map(([name, tool]) => ({
           name,
@@ -170,7 +181,7 @@ const createMcpServer = () => {
     );
   });
 
-  return { server, requests, sessionIds, deletedSessionIds };
+  return { server, requests, sessionIds, deletedSessionIds, options };
 };
 
 const MODEL_SCRIPT: ReadonlyArray<ReadonlyArray<object>> = [
@@ -354,5 +365,100 @@ describe("Pi's native MCP over streamable HTTP", () => {
     );
     expect(readFileSync(authFile, 'utf8')).toBe(stored);
     rmSync(authFile);
+  });
+});
+
+describe("Pi's native MCP after a session resumes from a session storage", () => {
+  const mcp = createMcpServer();
+  const scripted = useScriptedPiModel();
+  let mcpUrl = '';
+
+  beforeAll(async () => {
+    mcpUrl = await listen(mcp.server);
+  });
+
+  afterAll(async () => {
+    await close(mcp.server);
+  });
+
+  it('keeps a deferred tool that tool_search loaded in an earlier turn active', async () => {
+    const entries = new Map<string, StoredEntry>();
+    const sessionStorage: PiSessionStorage = {
+      append: async ({ entry }) => {
+        entries.set(entry.entryId, entry);
+      },
+      read: async ({ leafId }) => {
+        const path: StoredEntry[] = [];
+        for (let id: string | undefined = leafId; id != null; ) {
+          const entry = entries.get(id);
+          if (entry == null) break;
+          path.unshift(entry);
+          id = entry.parentEntryId;
+        }
+        return path;
+      },
+    };
+    const sessionWorkDir = '/sandbox/workspace';
+    const sandboxSession = await createJustBashSandbox({
+      cwd: sessionWorkDir,
+    }).createSession();
+    const start = (resumeFrom?: HarnessV1ResumeSessionState) =>
+      createFakePi(scripted.url, {
+        mcpServers: {
+          brand_ai: {
+            url: `${mcpUrl}/brand_ai`,
+            headers: { Authorization: `Bearer ${MCP_TOKEN}` },
+            exposure: 'deferred',
+          },
+        },
+        sessionStorage,
+      }).doStart({
+        sessionId: 'session-resumed-deferred-mcp',
+        sandboxSession,
+        sessionWorkDir,
+        resumeFrom,
+      });
+
+    scripted.model.enqueue(
+      toolCallChunks('tool_search', { query: 'brand check' }),
+      toolCallChunks('mcp__brand_ai__brand_check', { query: 'one' }),
+    );
+    const first = await start();
+    await runPromptTurn(first, 'Run a brand check.');
+    const resumeFrom = await first.doStop();
+
+    // The resumed session's MCP tools register after its first request
+    // would otherwise be prepared.
+    mcp.options.toolsListDelayMs = 300;
+    const firstResumedRequest = scripted.model.requests.length;
+    scripted.model.enqueue(
+      toolCallChunks('mcp__brand_ai__brand_check', { query: 'two' }),
+    );
+    const second = await start(resumeFrom);
+    try {
+      await runPromptTurn(second, 'Run the brand check again.');
+    } finally {
+      await second.doDestroy();
+    }
+
+    expect(
+      declaredToolNames(scripted.model.requests[firstResumedRequest]),
+    ).toContain('mcp__brand_ai__brand_check');
+    const removedTools = [...entries.values()].flatMap(({ data }) => {
+      const entry = data as {
+        type?: string;
+        message?: { role?: string; toolsRemoved?: { name: string }[] };
+      };
+      return entry.type === 'message' && entry.message?.role === 'system'
+        ? (entry.message.toolsRemoved ?? []).map(tool => tool.name)
+        : [];
+    });
+    expect(removedTools).not.toContain('mcp__brand_ai__brand_check');
+    expect(
+      mcp.requests.filter(
+        request =>
+          request.method === 'tools/call' && request.toolName === 'brand_check',
+      ),
+    ).toHaveLength(2);
   });
 });

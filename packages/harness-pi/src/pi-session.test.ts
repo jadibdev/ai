@@ -2241,6 +2241,7 @@ describe('createPiSession', () => {
       mcpMock.toolSearchFactory,
       mcpMock.mcpExtensionFactory,
       expect.any(Function),
+      expect.any(Function),
     ]);
     expect(piMock.createAgentSession).toHaveBeenCalledWith(
       expect.objectContaining({ noTools: 'builtin' }),
@@ -2438,6 +2439,7 @@ describe('createPiSession', () => {
         expect.any(Function),
         mcpMock.toolSearchFactory,
         mcpMock.mcpExtensionFactory,
+        expect.any(Function),
         expect.any(Function),
       ]);
       expect(factory).toHaveBeenCalledOnce();
