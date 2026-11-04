@@ -6,8 +6,10 @@ import { createJustBashSandbox } from '@ai-sdk/sandbox-just-bash';
 import { readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createPi } from './pi-harness';
+import { createRestoredMcpToolsExtension } from './pi-session';
 import type { PiSessionStorage } from './pi-session-storage';
 import {
   close,
@@ -460,5 +462,133 @@ describe("Pi's native MCP after a session resumes from a session storage", () =>
           request.method === 'tools/call' && request.toolName === 'brand_check',
       ),
     ).toHaveLength(2);
+  });
+});
+
+describe('createRestoredMcpToolsExtension', () => {
+  const TOOL = 'mcp__brand_ai__brand_check';
+
+  const systemEntry = (changes: {
+    toolsAdded?: string[];
+    toolsRemoved?: string[];
+  }) => ({
+    type: 'message',
+    message: {
+      role: 'system',
+      toolsAdded: changes.toolsAdded?.map(name => ({ name })),
+      toolsRemoved: changes.toolsRemoved?.map(name => ({ name })),
+    },
+  });
+
+  // Runs the extension's before_agent_start handler against a fake Pi API.
+  const runRestore = async ({
+    branch,
+    active = ['read'],
+    registered,
+    serverNames = ['brand_ai'],
+    timeoutMs = 50,
+    signal,
+  }: {
+    branch: object[];
+    active?: string[];
+    registered: (poll: number) => string[];
+    serverNames?: string[];
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) => {
+    let handler:
+      | ((event: unknown, ctx: unknown) => Promise<void> | void)
+      | undefined;
+    let polls = 0;
+    const setActiveTools = vi.fn();
+    const pi = {
+      on: (event: string, listener: typeof handler) => {
+        if (event === 'before_agent_start') handler = listener;
+      },
+      getActiveTools: () => [...active],
+      getAllTools: () => registered(polls++).map(name => ({ name })),
+      setActiveTools,
+    };
+    createRestoredMcpToolsExtension(
+      serverNames,
+      timeoutMs,
+      () => signal,
+    )(pi as unknown as ExtensionAPI);
+
+    const startedAt = Date.now();
+    await handler!(
+      { type: 'before_agent_start' },
+      { sessionManager: { getBranch: () => branch } },
+    );
+    return { setActiveTools, durationMs: Date.now() - startedAt };
+  };
+
+  it('gracefully times out and leaves unrecovered tools inactive when server fails to reconnect', async () => {
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      registered: () => [],
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeGreaterThanOrEqual(45);
+    expect(durationMs).toBeLessThan(2_000);
+  });
+
+  it('does not reactivate tools that were explicitly removed in previous turn', async () => {
+    const { setActiveTools } = await runRestore({
+      branch: [
+        systemEntry({ toolsAdded: [TOOL] }),
+        systemEntry({ toolsRemoved: [TOOL] }),
+      ],
+      registered: () => [TOOL],
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates tool names when activating registered tools', async () => {
+    const active = ['read'];
+    const { setActiveTools } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      active,
+      // The tool registers on the second poll, and something else activates
+      // it in the meantime.
+      registered: poll => {
+        if (poll === 0) return [];
+        if (!active.includes(TOOL)) active.push(TOOL);
+        return [TOOL];
+      },
+    });
+
+    expect(setActiveTools).toHaveBeenCalledOnce();
+    const [activated] = setActiveTools.mock.calls[0] as [string[]];
+    expect(activated).toEqual(expect.arrayContaining(['read', TOOL]));
+    expect(activated.filter(name => name === TOOL)).toHaveLength(1);
+  });
+
+  it('bails out of tool restoration wait when prompt turn is aborted', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 60);
+
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      registered: () => [],
+      timeoutMs: 10_000,
+      signal: controller.signal,
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeLessThan(1_000);
+  });
+
+  it('does not wait for tools of an MCP server that is no longer configured', async () => {
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: ['mcp__removed_server__tool'] })],
+      registered: () => [],
+      timeoutMs: 10_000,
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeLessThan(1_000);
   });
 });
