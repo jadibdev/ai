@@ -4743,7 +4743,10 @@ describe('streamText', () => {
         onStepError,
       });
 
-      await result.consumeStream();
+      await Promise.all([
+        result.consumeStream(),
+        vi.advanceTimersByTimeAsync(10_000),
+      ]);
 
       expect(attempts).toBe(3);
       expect(onStepStart).toHaveBeenCalledTimes(1);
@@ -33823,4 +33826,303 @@ it('sanitizes streamed provider request URLs in results and step/end events', as
     );
   }
   expect(request.url).toContain('password');
+});
+
+describe('issue #24524: streamRetries delay and backoff', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('ST-R1: should apply exponential backoff between stream retries (2s, then 4s)', async () => {
+    let callCount = 0;
+    const timestamps: number[] = [];
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          timestamps.push(Date.now());
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'error', error: new Error('interrupted') },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 2,
+      onError: () => {},
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(callCount).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(3);
+
+    await streamPromise;
+  });
+
+  it('ST-R2: should honor retry-after-ms header on failed response', async () => {
+    let callCount = 0;
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'error',
+                error: new APICallError({
+                  message: 'Rate limit',
+                  url: 'https://example.com',
+                  requestBodyValues: {},
+                  responseHeaders: { 'retry-after-ms': '3500' },
+                }),
+              },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 1,
+      onError: () => {},
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(3499);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(2);
+
+    await streamPromise;
+  });
+
+  it('ST-R3: should honor case-insensitive Retry-After header in seconds', async () => {
+    let callCount = 0;
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'error',
+                error: new APICallError({
+                  message: 'Rate limit',
+                  url: 'https://example.com',
+                  requestBodyValues: {},
+                  responseHeaders: { 'Retry-After': '5' },
+                }),
+              },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 1,
+      onError: () => {},
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(2);
+
+    await streamPromise;
+  });
+
+  it('ST-R4: should merge headers field-by-field (error headers override response headers per key)', async () => {
+    let callCount = 0;
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'error',
+                error: new APICallError({
+                  message: 'Rate limit',
+                  url: 'https://example.com',
+                  requestBodyValues: {},
+                  responseHeaders: { 'retry-after': '10' },
+                }),
+              },
+            ]),
+            response: {
+              headers: { 'retry-after-ms': '2500' },
+            },
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 1,
+      onError: () => {},
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(2499);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(2);
+
+    await streamPromise;
+  });
+
+  it('ST-R5: should preserve native abort lifecycle when aborted during backoff delay', async () => {
+    let callCount = 0;
+    const onAbort = vi.fn();
+    const abortController = new AbortController();
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'error', error: new Error('interrupted') },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 1,
+      abortSignal: abortController.signal,
+      onAbort,
+      onError: () => {},
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    abortController.abort();
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await streamPromise;
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    expect(callCount).toBe(1);
+  });
+
+  it('ST-R6: should stop cleanly without zombie re-dial if downstream consumer cancels during backoff', async () => {
+    let callCount = 0;
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'error', error: new Error('interrupted') },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 1,
+      _internal: {
+        retention: { replay: false, collectContent: false },
+      },
+      onError: () => {},
+    });
+
+    const reader = result.fullStream.getReader();
+    const readPromise = reader.read();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await reader.cancel('consumer break');
+    await readPromise;
+
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(callCount).toBe(1);
+  });
+
+  it('ST-R7: should apply 2000ms backoff on callback-directed retry', async () => {
+    let callCount = 0;
+
+    const result = streamText({
+      model: new MockLanguageModelV4({
+        doStream: async () => {
+          callCount++;
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'error', error: new Error('interrupted') },
+            ]),
+          };
+        },
+      }),
+      prompt: 'test',
+      maxRetries: 0,
+      streamRetries: 0,
+      onError: () => ({ retry: true }),
+    });
+
+    const streamPromise = result.consumeStream();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(callCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callCount).toBe(2);
+
+    await streamPromise;
+  });
 });

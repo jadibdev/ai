@@ -8,6 +8,7 @@ import {
 import {
   asArray,
   createIdGenerator,
+  delay,
   DelayedPromise,
   filterNullable,
   isAbortError,
@@ -86,6 +87,7 @@ import { mergeObjects } from '../util/merge-objects';
 import { notify } from '../util/notify';
 import { now as originalNow } from '../util/now';
 import { prepareRetries } from '../util/prepare-retries';
+import { getRetryDelayInMs } from '../util/retry-with-exponential-backoff';
 import { setAbortTimeout } from '../util/set-abort-timeout';
 import type { ActiveTools } from './active-tools';
 import { collectToolApprovals } from './collect-tool-approvals';
@@ -351,7 +353,7 @@ type StreamTextOptions<
  * If set and supported by the model, calls will generate deterministic results.
  *
  * @param maxRetries - Maximum number of retries. Set to 0 to disable retries. Default: 2.
- * @param streamRetries - Maximum number of retries for provider errors received after streaming starts. Set to 0 to disable automatic stream retries while allowing `onError` to request retries. Omit to disable all stream retry behavior. Default: 0.
+ * @param streamRetries - Maximum number of retries for provider errors received after streaming starts. Retries apply exponential backoff (starting at 2s) and honor provider `retry-after` / `retry-after-ms` headers. Set to 0 to disable automatic stream retries while allowing `onError` to request retries. Omit to disable all stream retry behavior. Default: 0.
  * @param abortSignal - An optional abort signal that can be used to cancel the call.
  * @param timeout - An optional timeout in milliseconds. The call will be aborted if it takes longer than the specified timeout.
  * @param headers - Additional HTTP headers to be sent with the request. Only applicable for HTTP-based providers.
@@ -727,7 +729,8 @@ function streamTextInternal<
        * request one retry. When automatic retries are configured, `onError` can
        * request at most one additional retry after they are exhausted. Omit this
        * option to disable all stream retry behavior and preserve incremental tool
-       * streaming for existing `onError` observers.
+       * streaming for existing `onError` observers. Retries apply exponential backoff
+       * (starting at 2s) and honor provider `retry-after` / `retry-after-ms` headers.
        *
        * @default 0 (stream retry behavior disabled when omitted)
        */
@@ -2780,6 +2783,8 @@ class DefaultStreamTextResult<
           const openTextParts = new Set<string>();
           const openReasoningParts = new Set<string>();
           let enqueueStreamRetryAttemptBoundary = false;
+          let isStreamCancelled = false;
+          let retryWaitAbortController: AbortController | undefined;
           const shouldBufferToolParts =
             streamRetries > 0 || canRetryStreamViaOnError;
 
@@ -2941,19 +2946,60 @@ class DefaultStreamTextResult<
                 bufferedAttemptParts = [];
                 closeOpenAttemptParts();
 
+                if (isStreamCancelled) {
+                  return;
+                }
+
+                const retryAttempt =
+                  automaticStreamRetryCount + callbackStreamRetryCount;
+                const initialDelayInMs = 2000;
+                const backoffFactor = 2;
+                const exponentialBackoffDelay =
+                  initialDelayInMs *
+                  Math.pow(backoffFactor, Math.max(0, retryAttempt - 1));
+
+                const retryDelayInMs = getRetryDelayInMs({
+                  error,
+                  responseHeaders: response?.headers,
+                  exponentialBackoffDelay,
+                });
+
                 let retryLanguageModelCall: Awaited<
                   ReturnType<typeof callLanguageModel>
                 >;
                 try {
+                  retryWaitAbortController = new AbortController();
+                  await delay(retryDelayInMs, {
+                    abortSignal: mergeAbortSignals(
+                      abortSignal,
+                      retryWaitAbortController.signal,
+                    ),
+                  });
+
+                  if (isStreamCancelled) {
+                    return;
+                  }
+
                   retryLanguageModelCall = await callLanguageModel();
                 } catch (retryError) {
+                  if (isStreamCancelled) {
+                    return;
+                  }
+
+                  if (isAbortError(retryError) && abortSignal?.aborted) {
+                    throw retryError;
+                  }
+
                   controller.enqueue({
                     type: 'error',
                     error: retryError,
                   });
                   controller.close();
                   return;
+                } finally {
+                  retryWaitAbortController = undefined;
                 }
+
                 request = retryLanguageModelCall.request;
                 response = retryLanguageModelCall.response;
                 languageModelStreamReader =
@@ -2963,7 +3009,9 @@ class DefaultStreamTextResult<
               }
             },
             cancel(reason) {
+              isStreamCancelled = true;
               clearModelOutputTimeouts();
+              retryWaitAbortController?.abort(reason);
               return languageModelStreamReader.cancel(reason);
             },
           });
