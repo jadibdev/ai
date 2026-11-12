@@ -1,0 +1,118 @@
+name: Validate PR
+
+# Runs only on the jadibdev/ai fork. A push to validate/** carries
+# .validate/config.sh (PR, FILTER, CWD, TEST_CMD) and .validate/*.mjs scripts.
+# It runs the scripts and tests twice: on vercel/ai main (with the PR's test
+# files overlaid), and on main with the PR merged. Results go to the job
+# summary and the "validation-logs" artifact.
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'jadibdev/ai'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Load config
+        run: |
+          set -euo pipefail
+          cp -r .validate "$RUNNER_TEMP/validate"
+          source "$RUNNER_TEMP/validate/config.sh"
+          echo "PR=$PR" >> "$GITHUB_ENV"
+          git config user.name validator
+          git config user.email validator@users.noreply.github.com
+          git remote add upstream https://github.com/vercel/ai.git
+          git fetch --quiet upstream main "pull/$PR/head:refs/remotes/pr/$PR"
+          echo "BASE=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$(git rev-parse pr/$PR)" >> "$GITHUB_ENV"
+          git checkout --quiet --detach upstream/main
+
+      - name: Setup pnpm and Node.js
+        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3
+        with:
+          runtime: node@22
+          cache: true
+          require-lockfile: true
+
+      - name: Run before (main) and after (PR merged onto main)
+        run: |
+          # Expected failures (the bug on main, new tests) must not stop the step.
+          set +e -uo pipefail
+          source "$RUNNER_TEMP/validate/config.sh"
+          LOGS="$RUNNER_TEMP/logs"; mkdir -p "$LOGS"
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Validation of vercel/ai#$PR"
+            echo "- main: \`$BASE\`"
+            echo "- PR head: \`$HEAD_SHA\`"
+            echo "- Node: \`$(node --version)\`, pnpm: \`$(pnpm --version)\`"
+            echo
+            echo "| Phase | Step | Exit |"
+            echo "| --- | --- | --- |"
+          } >> "$SUMMARY"
+
+          run_phase() {
+            local phase=$1
+            pnpm install --frozen-lockfile > "$LOGS/$phase-install.log" 2>&1
+            echo "| $phase | install | $? |" >> "$SUMMARY"
+            pnpm exec turbo build --filter="$FILTER" > "$LOGS/$phase-build.log" 2>&1
+            echo "| $phase | build \`$FILTER\` | $? |" >> "$SUMMARY"
+            for script in "$RUNNER_TEMP"/validate/*.mjs; do
+              [ -e "$script" ] || continue
+              local name; name=$(basename "$script" .mjs)
+              (cd "$CWD" && timeout 300 node --input-type=module < "$script") > "$LOGS/$phase-$name.log" 2>&1
+              echo "| $phase | \`$name.mjs\` | $? |" >> "$SUMMARY"
+            done
+            if [ -n "${TEST_CMD:-}" ]; then
+              (cd "$CWD" && eval "$TEST_CMD") > "$LOGS/$phase-tests.log" 2>&1
+              echo "| $phase | tests | $? |" >> "$SUMMARY"
+            fi
+          }
+
+          # Before: main source, with the PR's test files overlaid so the new
+          # tests show whether they fail without the fix.
+          TESTS=$(git diff --name-only "$BASE...$HEAD_SHA" | grep -E '\.test(-d)?\.tsx?$' || true)
+          if [ -n "$TESTS" ]; then git checkout --quiet "$HEAD_SHA" -- $TESTS; fi
+          run_phase before
+          git checkout --quiet -f --detach "$BASE"
+          git clean -fdq -e node_modules
+
+          # After: the PR merged onto main.
+          if git merge --quiet --no-edit "$HEAD_SHA" > "$LOGS/merge.log" 2>&1; then
+            echo "| after | merge onto main | 0 |" >> "$SUMMARY"
+            run_phase after
+          else
+            echo "| after | merge onto main | conflict |" >> "$SUMMARY"
+          fi
+
+          {
+            echo
+            for f in "$LOGS"/*.log; do
+              case "$f" in *install.log|*build.log) continue;; esac
+              echo "<details><summary>$(basename "$f")</summary>"
+              echo
+              echo '```'
+              grep -vE '^\s+at |^\s*$' "$f" | tail -n 60
+              echo '```'
+              echo "</details>"
+            done
+          } >> "$SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-logs
+          path: ${{ runner.temp }}/logs
