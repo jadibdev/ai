@@ -780,6 +780,11 @@ export async function createPiSession(
           mcpRegistrationError = error;
         }
       },
+      createRestoredMcpToolsExtension(
+        mcpServers.map(([name]) => name),
+        undefined,
+        () => currentTurnAbortSignal,
+      ),
     );
   }
   const hasExtensionFactories = extensionFactories.length > 0;
@@ -899,6 +904,8 @@ export async function createPiSession(
 
   // Emit channel set at the start of every doPromptTurn and cleared on end.
   let currentEmit: ((part: HarnessV1StreamPart) => void) | undefined;
+  // Abort signal of the active turn, with the same lifecycle as currentEmit.
+  let currentTurnAbortSignal: AbortSignal | undefined;
   let translatorState: PiTranslatorState | undefined;
   let activeTurn: ActivePiTurn | undefined;
   /*
@@ -1549,6 +1556,7 @@ export async function createPiSession(
     const userTools = turnOpts.tools;
     currentEmit = turnOpts.emit;
     const turnAbortController = new AbortController();
+    currentTurnAbortSignal = turnAbortController.signal;
     const abort = async (reason?: unknown): Promise<void> => {
       if (turnAbortController.signal.aborted) return;
       if (reason === undefined) {
@@ -1703,6 +1711,7 @@ export async function createPiSession(
       if (activeTurn?.token === activeTurnToken) {
         activeTurn = undefined;
         currentEmit = undefined;
+        currentTurnAbortSignal = undefined;
       }
     });
     activeTurn = {
@@ -2014,6 +2023,87 @@ function createInMemoryMcpCredentialStore(): PiMcpCredentialStore {
   };
   // Pi types the option as its store class, which has private members.
   return store as PiMcpCredentialStore;
+}
+
+const RESTORED_MCP_TOOLS_TIMEOUT_MS = 10_000;
+const RESTORED_MCP_TOOLS_POLL_MS = 25;
+
+/*
+ * When a session is rebuilt from its entries, Pi restores the MCP tools of the
+ * recorded loadout as pending while the servers connect. Pi's MCP extension
+ * makes the first prompt wait only for servers with `direct` tools, so the
+ * tools of a `deferred` server that `tool_search` loaded in an earlier turn
+ * are usually not registered yet when the first request is prepared, and Pi
+ * declares them removed.
+ *
+ * Before the first agent loop of each Pi runtime, this extension waits for the
+ * MCP tools that the transcript still declares and activates them again:
+ * - The transcript is the source of truth: its `toolsAdded` and `toolsRemoved`
+ *   are replayed, so a tool that was removed earlier stays removed.
+ * - Only tools of the configured MCP servers are restored, so a server that
+ *   was removed from the settings is never waited for.
+ * - The wait is a bounded grace period: a tool whose server does not register
+ *   it in time stays inactive, as before. An aborted turn stops the wait.
+ */
+export function createRestoredMcpToolsExtension(
+  serverNames: ReadonlyArray<string>,
+  timeoutMs: number = RESTORED_MCP_TOOLS_TIMEOUT_MS,
+  getAbortSignal: () => AbortSignal | undefined = () => undefined,
+): ExtensionFactory {
+  // Pi sanitizes `mcp__<server>__<tool>` by replacing non-alphanumeric chars with `_`.
+  const prefixes = serverNames.map(
+    name => `mcp__${name.replace(/[^A-Za-z0-9_]/g, '_')}__`,
+  );
+  return (pi: ExtensionAPI) => {
+    let checked = false;
+    pi.on('before_agent_start', async (_event, ctx) => {
+      if (checked) return;
+
+      const declared = new Set<string>();
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== 'message' || entry.message?.role !== 'system') {
+          continue;
+        }
+        for (const tool of entry.message.toolsRemoved ?? []) {
+          declared.delete(tool.name);
+        }
+        for (const tool of entry.message.toolsAdded ?? []) {
+          declared.add(tool.name);
+        }
+      }
+      const active = new Set(pi.getActiveTools());
+      const restored = [...declared].filter(
+        name =>
+          !active.has(name) && prefixes.some(prefix => name.startsWith(prefix)),
+      );
+      if (restored.length === 0) {
+        checked = true;
+        return;
+      }
+
+      const isRegistered = (name: string) =>
+        pi.getAllTools().some(tool => tool.name === name);
+      const isAborted = () => getAbortSignal()?.aborted === true;
+      const deadline = Date.now() + timeoutMs;
+      while (
+        !restored.every(isRegistered) &&
+        Date.now() < deadline &&
+        !isAborted()
+      ) {
+        await new Promise(resolve =>
+          setTimeout(resolve, RESTORED_MCP_TOOLS_POLL_MS),
+        );
+      }
+      if (isAborted()) return;
+      checked = true;
+      const registered = restored.filter(isRegistered);
+      if (registered.length > 0) {
+        pi.setActiveTools([
+          ...new Set([...pi.getActiveTools(), ...registered]),
+        ]);
+      }
+    });
+  };
 }
 
 function assertPiMcpSettingsSupported(

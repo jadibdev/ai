@@ -1,10 +1,16 @@
-import type { HarnessV1StreamPart } from '@ai-sdk/harness';
+import type {
+  HarnessV1ResumeSessionState,
+  HarnessV1StreamPart,
+} from '@ai-sdk/harness';
 import { createJustBashSandbox } from '@ai-sdk/sandbox-just-bash';
 import { readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createPi } from './pi-harness';
+import { createRestoredMcpToolsExtension } from './pi-session';
+import type { PiSessionStorage } from './pi-session-storage';
 import {
   close,
   createFakePi,
@@ -17,6 +23,8 @@ import {
 } from './test-helpers';
 
 const MCP_TOKEN = 'mcp-test-token';
+
+type StoredEntry = Parameters<PiSessionStorage['append']>[0]['entry'];
 
 type JsonRpcRequest = {
   readonly id?: number | string;
@@ -59,6 +67,8 @@ const createMcpServer = () => {
   const requests: McpRequestRecord[] = [];
   const sessionIds = new Map<string, string>();
   const deletedSessionIds: string[] = [];
+  // Delays `tools/list`, so tests can hold a session's MCP tools back.
+  const options = { toolsListDelayMs: 0 };
 
   const respond = (
     response: ServerResponse,
@@ -116,6 +126,9 @@ const createMcpServer = () => {
       return;
     }
     if (message.method === 'tools/list') {
+      await new Promise(resolve =>
+        setTimeout(resolve, options.toolsListDelayMs),
+      );
       respond(response, sessionId, message.id, {
         tools: Object.entries(tools).map(([name, tool]) => ({
           name,
@@ -170,7 +183,7 @@ const createMcpServer = () => {
     );
   });
 
-  return { server, requests, sessionIds, deletedSessionIds };
+  return { server, requests, sessionIds, deletedSessionIds, options };
 };
 
 const MODEL_SCRIPT: ReadonlyArray<ReadonlyArray<object>> = [
@@ -354,5 +367,286 @@ describe("Pi's native MCP over streamable HTTP", () => {
     );
     expect(readFileSync(authFile, 'utf8')).toBe(stored);
     rmSync(authFile);
+  });
+});
+
+describe("Pi's native MCP after a session resumes from a session storage", () => {
+  const mcp = createMcpServer();
+  const scripted = useScriptedPiModel();
+  let mcpUrl = '';
+
+  beforeAll(async () => {
+    mcpUrl = await listen(mcp.server);
+  });
+
+  afterAll(async () => {
+    await close(mcp.server);
+  });
+
+  it('keeps a deferred tool that tool_search loaded in an earlier turn active', async () => {
+    const entries = new Map<string, StoredEntry>();
+    const sessionStorage: PiSessionStorage = {
+      append: async ({ entry }) => {
+        entries.set(entry.entryId, entry);
+      },
+      read: async ({ leafId }) => {
+        const path: StoredEntry[] = [];
+        for (let id: string | undefined = leafId; id != null; ) {
+          const entry = entries.get(id);
+          if (entry == null) break;
+          path.unshift(entry);
+          id = entry.parentEntryId;
+        }
+        return path;
+      },
+    };
+    const sessionWorkDir = '/sandbox/workspace';
+    const sandboxSession = await createJustBashSandbox({
+      cwd: sessionWorkDir,
+    }).createSession();
+    const start = (resumeFrom?: HarnessV1ResumeSessionState) =>
+      createFakePi(scripted.url, {
+        mcpServers: {
+          brand_ai: {
+            url: `${mcpUrl}/brand_ai`,
+            headers: { Authorization: `Bearer ${MCP_TOKEN}` },
+            exposure: 'deferred',
+          },
+        },
+        sessionStorage,
+      }).doStart({
+        sessionId: 'session-resumed-deferred-mcp',
+        sandboxSession,
+        sessionWorkDir,
+        resumeFrom,
+      });
+
+    scripted.model.enqueue(
+      toolCallChunks('tool_search', { query: 'brand check' }),
+      toolCallChunks('mcp__brand_ai__brand_check', { query: 'one' }),
+    );
+    const first = await start();
+    await runPromptTurn(first, 'Run a brand check.');
+    const resumeFrom = await first.doStop();
+
+    // The resumed session's MCP tools register after its first request
+    // would otherwise be prepared.
+    mcp.options.toolsListDelayMs = 300;
+    const firstResumedRequest = scripted.model.requests.length;
+    scripted.model.enqueue(
+      toolCallChunks('mcp__brand_ai__brand_check', { query: 'two' }),
+    );
+    const second = await start(resumeFrom);
+    try {
+      await runPromptTurn(second, 'Run the brand check again.');
+    } finally {
+      await second.doDestroy();
+    }
+
+    expect(
+      declaredToolNames(scripted.model.requests[firstResumedRequest]),
+    ).toContain('mcp__brand_ai__brand_check');
+    const removedTools = [...entries.values()].flatMap(({ data }) => {
+      const entry = data as {
+        type?: string;
+        message?: { role?: string; toolsRemoved?: { name: string }[] };
+      };
+      return entry.type === 'message' && entry.message?.role === 'system'
+        ? (entry.message.toolsRemoved ?? []).map(tool => tool.name)
+        : [];
+    });
+    expect(removedTools).not.toContain('mcp__brand_ai__brand_check');
+    expect(
+      mcp.requests.filter(
+        request =>
+          request.method === 'tools/call' && request.toolName === 'brand_check',
+      ),
+    ).toHaveLength(2);
+  });
+});
+
+describe('createRestoredMcpToolsExtension', () => {
+  const TOOL = 'mcp__brand_ai__brand_check';
+
+  const systemEntry = (changes: {
+    toolsAdded?: string[];
+    toolsRemoved?: string[];
+  }) => ({
+    type: 'message',
+    message: {
+      role: 'system',
+      toolsAdded: changes.toolsAdded?.map(name => ({ name })),
+      toolsRemoved: changes.toolsRemoved?.map(name => ({ name })),
+    },
+  });
+
+  // Runs the extension's before_agent_start handler against a fake Pi API.
+  const runRestore = async ({
+    branch,
+    active = ['read'],
+    registered,
+    serverNames = ['brand_ai'],
+    timeoutMs = 50,
+    signal,
+  }: {
+    branch: object[];
+    active?: string[];
+    registered: (poll: number) => string[];
+    serverNames?: string[];
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) => {
+    let handler:
+      | ((event: unknown, ctx: unknown) => Promise<void> | void)
+      | undefined;
+    let polls = 0;
+    const setActiveTools = vi.fn();
+    const pi = {
+      on: (event: string, listener: typeof handler) => {
+        if (event === 'before_agent_start') handler = listener;
+      },
+      getActiveTools: () => [...active],
+      getAllTools: () => registered(polls++).map(name => ({ name })),
+      setActiveTools,
+    };
+    createRestoredMcpToolsExtension(
+      serverNames,
+      timeoutMs,
+      () => signal,
+    )(pi as unknown as ExtensionAPI);
+
+    const startedAt = Date.now();
+    await handler!(
+      { type: 'before_agent_start' },
+      { sessionManager: { getBranch: () => branch } },
+    );
+    return { setActiveTools, durationMs: Date.now() - startedAt };
+  };
+
+  it('gracefully times out and leaves unrecovered tools inactive when server fails to reconnect', async () => {
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      registered: () => [],
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeGreaterThanOrEqual(45);
+    expect(durationMs).toBeLessThan(2_000);
+  });
+
+  it('does not reactivate tools that were explicitly removed in previous turn', async () => {
+    const { setActiveTools } = await runRestore({
+      branch: [
+        systemEntry({ toolsAdded: [TOOL] }),
+        systemEntry({ toolsRemoved: [TOOL] }),
+      ],
+      registered: () => [TOOL],
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates tool names when activating registered tools', async () => {
+    const active = ['read'];
+    const { setActiveTools } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      active,
+      // The tool registers on the second poll, and something else activates
+      // it in the meantime.
+      registered: poll => {
+        if (poll === 0) return [];
+        if (!active.includes(TOOL)) active.push(TOOL);
+        return [TOOL];
+      },
+    });
+
+    expect(setActiveTools).toHaveBeenCalledOnce();
+    const [activated] = setActiveTools.mock.calls[0] as [string[]];
+    expect(activated).toEqual(expect.arrayContaining(['read', TOOL]));
+    expect(activated.filter(name => name === TOOL)).toHaveLength(1);
+  });
+
+  it('bails out of tool restoration wait when prompt turn is aborted', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 60);
+
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [TOOL] })],
+      registered: () => [],
+      timeoutMs: 10_000,
+      signal: controller.signal,
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeLessThan(1_000);
+  });
+
+  it('does not wait for tools of an MCP server that is no longer configured', async () => {
+    const { setActiveTools, durationMs } = await runRestore({
+      branch: [systemEntry({ toolsAdded: ['mcp__removed_server__tool'] })],
+      registered: () => [],
+      timeoutMs: 10_000,
+    });
+
+    expect(setActiveTools).not.toHaveBeenCalled();
+    expect(durationMs).toBeLessThan(1_000);
+  });
+
+  it('normalizes non-alphanumeric server names like Pi MCP tool registration', async () => {
+    const dottedTool = 'mcp__my_server_1__echo';
+    const { setActiveTools } = await runRestore({
+      branch: [systemEntry({ toolsAdded: [dottedTool] })],
+      serverNames: ['my.server-1'],
+      registered: () => [dottedTool],
+    });
+
+    expect(setActiveTools).toHaveBeenCalledOnce();
+    expect(setActiveTools.mock.calls[0]?.[0]).toContain(dottedTool);
+  });
+
+  it('retries restoration on a later turn if the first wait was aborted', async () => {
+    let handler:
+      | ((event: unknown, ctx: unknown) => Promise<void> | void)
+      | undefined;
+    let registeredTools: string[] = [];
+    let signal = new AbortController();
+    const setActiveTools = vi.fn();
+    const pi = {
+      on: (event: string, listener: typeof handler) => {
+        if (event === 'before_agent_start') handler = listener;
+      },
+      getActiveTools: () => ['read'],
+      getAllTools: () => registeredTools.map(name => ({ name })),
+      setActiveTools,
+    };
+    createRestoredMcpToolsExtension(
+      ['brand_ai'],
+      10_000,
+      () => signal.signal,
+    )(pi as unknown as ExtensionAPI);
+
+    setTimeout(() => signal.abort(), 40);
+    await handler!(
+      { type: 'before_agent_start' },
+      {
+        sessionManager: {
+          getBranch: () => [systemEntry({ toolsAdded: [TOOL] })],
+        },
+      },
+    );
+    expect(setActiveTools).not.toHaveBeenCalled();
+
+    signal = new AbortController();
+    registeredTools = [TOOL];
+    await handler!(
+      { type: 'before_agent_start' },
+      {
+        sessionManager: {
+          getBranch: () => [systemEntry({ toolsAdded: [TOOL] })],
+        },
+      },
+    );
+    expect(setActiveTools).toHaveBeenCalledOnce();
+    expect(setActiveTools.mock.calls[0]?.[0]).toContain(TOOL);
   });
 });
