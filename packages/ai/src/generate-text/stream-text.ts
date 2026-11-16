@@ -2263,10 +2263,14 @@ class DefaultStreamTextResult<
 
       // initial tool execution step stream
       if (deniedToolApprovals.length > 0 || approvedToolApprovals.length > 0) {
-        if (abortSignal?.aborted) {
+        const abortPreStepToolExecution = () => {
           steeringRun?.end('aborted');
           self.rejectResultPromises(abortSignal?.reason);
           self.closeStream();
+        };
+
+        if (abortSignal?.aborted) {
+          abortPreStepToolExecution();
           return;
         }
 
@@ -2285,7 +2289,13 @@ class DefaultStreamTextResult<
           runtimeContext,
           toolApprovalSecret: experimental_toolApprovalSecret,
           refineToolInput,
+          abortSignal,
         });
+
+        if (abortSignal?.aborted) {
+          abortPreStepToolExecution();
+          return;
+        }
 
         const localDeniedToolApprovals = [
           ...deniedToolApprovals.filter(
@@ -2450,9 +2460,7 @@ class DefaultStreamTextResult<
         }
 
         if (abortSignal?.aborted) {
-          steeringRun?.end('aborted');
-          self.rejectResultPromises(abortSignal?.reason);
-          self.closeStream();
+          abortPreStepToolExecution();
           return;
         }
       }
