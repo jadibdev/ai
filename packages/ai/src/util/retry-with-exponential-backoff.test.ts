@@ -5,7 +5,10 @@ import {
   GatewayRateLimitError,
   GatewayAuthenticationError,
 } from '@ai-sdk/gateway';
-import { retryWithExponentialBackoffRespectingRetryHeaders } from './retry-with-exponential-backoff';
+import {
+  getRetryDelayInMs,
+  retryWithExponentialBackoffRespectingRetryHeaders,
+} from './retry-with-exponential-backoff';
 
 describe('retryWithExponentialBackoffRespectingRetryHeaders', () => {
   beforeEach(() => {
@@ -558,6 +561,110 @@ describe('retryWithExponentialBackoffRespectingRetryHeaders', () => {
 
       const result = await promise;
       expect(result).toBe('success');
+    });
+  });
+
+  describe('getRetryDelayInMs', () => {
+    it('should return exponentialBackoffDelay when no headers provided', () => {
+      const delay = getRetryDelayInMs({
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(2000);
+    });
+
+    it('should extract retry-after-ms from APICallError responseHeaders', () => {
+      const error = new APICallError({
+        message: 'Rate limit',
+        url: 'https://example.com',
+        requestBodyValues: {},
+        responseHeaders: { 'retry-after-ms': '1500' },
+      });
+      const delay = getRetryDelayInMs({
+        error,
+        exponentialBackoffDelay: 4000,
+      });
+      expect(delay).toBe(1500);
+    });
+
+    it('should extract retry-after-ms from error.cause when APICallError is wrapped', () => {
+      const cause = new APICallError({
+        message: 'Rate limit',
+        url: 'https://example.com',
+        requestBodyValues: {},
+        responseHeaders: { 'retry-after-ms': '2500' },
+      });
+      const error = new Error('Wrapped error', { cause });
+      const delay = getRetryDelayInMs({
+        error,
+        exponentialBackoffDelay: 8000,
+      });
+      expect(delay).toBe(2500);
+    });
+
+    it('should extract retry-after-ms from fallback responseHeaders', () => {
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'retry-after-ms': '3500' },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(3500);
+    });
+
+    it('should merge headers field-by-field (error headers override response headers per key)', () => {
+      const error = new APICallError({
+        message: 'Rate limit',
+        url: 'https://example.com',
+        requestBodyValues: {},
+        responseHeaders: { 'retry-after': '10' },
+      });
+      const delay = getRetryDelayInMs({
+        error,
+        responseHeaders: { 'retry-after-ms': '4500' },
+        exponentialBackoffDelay: 2000,
+      });
+      // retry-after-ms from responseHeaders is more precise than retry-after from error
+      expect(delay).toBe(4500);
+    });
+
+    it('should handle case-insensitive header keys', () => {
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'Retry-After': '7' },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(7000);
+    });
+
+    it('should parse HTTP date string for Retry-After', () => {
+      const futureDate = new Date(Date.now() + 5000).toUTCString();
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'retry-after': futureDate },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBeGreaterThan(4000);
+      expect(delay).toBeLessThanOrEqual(5100);
+    });
+
+    it('should fallback to exponential backoff when delay is negative', () => {
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'retry-after-ms': '-500' },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(2000);
+    });
+
+    it('should fallback to exponential backoff when delay is unparseable', () => {
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'retry-after': 'invalid-date' },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(2000);
+    });
+
+    it('should fallback to exponential backoff when delay exceeds 60s and is larger than backoff', () => {
+      const delay = getRetryDelayInMs({
+        responseHeaders: { 'retry-after-ms': '90000' },
+        exponentialBackoffDelay: 2000,
+      });
+      expect(delay).toBe(2000);
     });
   });
 });

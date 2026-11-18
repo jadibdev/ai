@@ -7,40 +7,74 @@ import {
 } from '@ai-sdk/provider-utils';
 import { RetryError } from './retry-error';
 
-function getRetryDelayInMs({
+function normalizeHeaders(
+  headers: Record<string, string | undefined> | undefined,
+): Record<string, string | undefined> | undefined {
+  if (headers == null) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]),
+  );
+}
+
+function getErrorHeaders(
+  error: unknown,
+): Record<string, string | undefined> | undefined {
+  if (error != null && APICallError.isInstance(error)) {
+    return normalizeHeaders(error.responseHeaders);
+  }
+
+  if (
+    error != null &&
+    APICallError.isInstance((error as { cause?: unknown }).cause)
+  ) {
+    return normalizeHeaders(
+      (error as { cause: APICallError }).cause.responseHeaders,
+    );
+  }
+
+  return undefined;
+}
+
+export function getRetryDelayInMs({
   error,
+  responseHeaders,
   exponentialBackoffDelay,
 }: {
-  error: APICallError | GatewayError;
+  error?: unknown;
+  responseHeaders?: Record<string, string | undefined>;
   exponentialBackoffDelay: number;
 }): number {
-  const headers = APICallError.isInstance(error)
-    ? error.responseHeaders
-    : APICallError.isInstance(error.cause)
-      ? (error.cause as APICallError).responseHeaders
-      : undefined;
+  const errorHeaders = getErrorHeaders(error);
+  const resHeaders = normalizeHeaders(responseHeaders);
 
-  if (!headers) return exponentialBackoffDelay;
+  const retryAfterMsVal =
+    errorHeaders?.['retry-after-ms'] ?? resHeaders?.['retry-after-ms'];
+  const retryAfterVal =
+    errorHeaders?.['retry-after'] ?? resHeaders?.['retry-after'];
+
+  if (retryAfterMsVal == null && retryAfterVal == null) {
+    return exponentialBackoffDelay;
+  }
 
   let ms: number | undefined;
 
-  // retry-ms is more precise than retry-after and used by e.g. OpenAI
-  const retryAfterMs = headers['retry-after-ms'];
-  if (retryAfterMs) {
-    const timeoutMs = parseFloat(retryAfterMs);
+  // retry-after-ms is more precise than retry-after and used by e.g. OpenAI
+  if (retryAfterMsVal != null) {
+    const timeoutMs = parseFloat(retryAfterMsVal);
     if (!Number.isNaN(timeoutMs)) {
       ms = timeoutMs;
     }
   }
 
   // About the Retry-After header: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-  const retryAfter = headers['retry-after'];
-  if (retryAfter && ms === undefined) {
-    const timeoutSeconds = parseFloat(retryAfter);
+  if (retryAfterVal != null && ms === undefined) {
+    const timeoutSeconds = parseFloat(retryAfterVal);
     if (!Number.isNaN(timeoutSeconds)) {
       ms = timeoutSeconds * 1000;
     } else {
-      ms = Date.parse(retryAfter) - Date.now();
+      ms = Date.parse(retryAfterVal) - Date.now();
     }
   }
 
